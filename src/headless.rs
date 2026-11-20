@@ -155,14 +155,22 @@ pub fn selftest() -> Result<(), String> {
     Ok(())
 }
 
-/// Physics cost per step for a range of particle counts.
-pub fn bench(sizes: &[usize]) -> Result<(), String> {
+/// Physics cost per step for a range of particle counts, after `warm` steps of evolution
+/// (crowded clumps form over time), with a per-stage breakdown where the GPU supports it.
+pub fn bench(sizes: &[usize], preset: Preset, warm: usize) -> Result<(), String> {
     let mut s = make_sim(1024, 64, 64)?;
     for &n in sizes {
         s.params.set(P::Count, n as f32);
-        s.reset(Preset::Galaxies, 1);
+        s.reset(preset, 1);
+        let mut done = 0;
+        while done < warm {
+            let k = (warm - done).min(8);
+            s.run_steps(k);
+            let _ = s.device().poll(wgpu::PollType::wait_indefinitely());
+            done += k;
+        }
         let mut ms = Vec::new();
-        for i in 0..40 {
+        for i in 0..30 {
             let _ = s.device().poll(wgpu::PollType::wait_indefinitely());
             let t = Instant::now();
             s.run_steps(1);
@@ -174,6 +182,14 @@ pub fn bench(sizes: &[usize]) -> Result<(), String> {
         println!(
             "{}",
             sim::bench_summary(s.capacity(), s.is_exact(), &mut ms).unwrap_or_default()
+        );
+        if let Some(st) = s.profile_step() {
+            println!("    {}", sim::stage_summary(&st));
+        }
+        let (max, crowded) = s.crowding();
+        println!(
+            "    fullest cell {max}, {} particles in cells over 64 (after {warm} steps)",
+            sim::group(crowded)
         );
     }
     Ok(())

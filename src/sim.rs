@@ -984,7 +984,13 @@ impl Sim {
     }
 
     fn report_bench(&mut self) {
-        if let Some(text) = bench_summary(self.capacity, self.is_exact(), &mut self.bench_ms) {
+        if let Some(mut text) = bench_summary(self.capacity, self.is_exact(), &mut self.bench_ms) {
+            if let Some(st) = self.profile_step() {
+                text += &format!("\n{}", stage_summary(&st));
+            }
+            let (max, crowded) = self.crowding();
+            text += &format!("\nfullest cell {max}, {} particles in cells over 64", group(crowded));
+            eprintln!("{text}");
             self.say(text);
         }
     }
@@ -1001,6 +1007,25 @@ impl Sim {
     pub fn read_state(&self) -> Vec<State> {
         let Some(w) = &self.world else { return vec![] };
         World::read(&self.device, &self.queue, &w.state[0], w.n)
+    }
+
+    /// Runs one step with per-stage GPU timestamps; returns "stage ms" pairs, or None if the
+    /// GPU has no timestamp queries.
+    pub fn profile_step(&mut self) -> Option<Vec<(&'static str, f64)>> {
+        let w = self.world.as_mut()?;
+        if !w.enable_profiling(&self.device, &self.queue) {
+            return None;
+        }
+        self.run_steps(1);
+        let w = self.world.as_mut()?;
+        w.stage_ms(&self.device, &self.queue)
+    }
+
+    /// (fullest hash bucket, particles in buckets of more than 64).
+    pub fn crowding(&self) -> (u32, usize) {
+        self.world
+            .as_ref()
+            .map_or((0, 0), |w| w.crowding(&self.device, &self.queue, 64))
     }
 
     pub fn is_exact(&self) -> bool {
@@ -1047,6 +1072,16 @@ pub fn bench_summary(capacity: usize, exact: bool, ms: &mut [f64]) -> Option<Str
         group(capacity),
         if exact { "exact gravity" } else { "grid gravity" },
     ))
+}
+
+/// "hash 0.12 · scan 0.05 · …" in ms.
+pub fn stage_summary(st: &[(&str, f64)]) -> String {
+    st.iter()
+        .filter(|(_, ms)| *ms > 0.0005)
+        .map(|(name, ms)| format!("{name} {ms:.2}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+        + " ms"
 }
 
 pub fn group(n: usize) -> String {

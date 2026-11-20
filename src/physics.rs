@@ -272,6 +272,18 @@ impl Pipelines {
     }
 }
 
+/// Stages timed by the profiler, in encoding order.
+pub const STAGES: [&str; 9] = [
+    "hash", "scan", "scatter", "fix", "gather", "deposit", "fft", "step", "holes",
+];
+
+struct Profiler {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    read: wgpu::Buffer,
+    period_ns: f32,
+}
+
 /// Buffers for one particle count.
 pub struct World {
     pub n: usize,
@@ -295,6 +307,8 @@ pub struct World {
     spawn_bg: wgpu::BindGroup,
     pm_bg: wgpu::BindGroup,
     kernel_key: Option<[u32; 2]>,
+    prof: Option<Profiler>,
+    prof_pending: bool,
     _keep: Vec<wgpu::Buffer>,
 }
 
@@ -453,6 +467,8 @@ impl World {
             spawn_bg,
             pm_bg,
             kernel_key: None,
+            prof: None,
+            prof_pending: false,
             _keep: keep,
         };
         queue.write_buffer(&tw, 0, bytemuck::cast_slice(&tw_data));
@@ -535,49 +551,164 @@ impl World {
         }
         let n = self.n;
         let sort = &pipes.sort.pipes;
-        for _ in 0..steps {
+        let profiling = self.prof.is_some();
+        for step in 0..steps {
             enc.clear_buffer(&self.counts, 0, None);
             if !self.exact {
                 enc.clear_buffer(&self.grid, 0, None);
             }
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("step"),
-                timestamp_writes: None,
-            });
-            dispatch(&mut pass, &sort[0], &self.sort_bg, n);
-            // prefix sum up the levels, then add block offsets back down
-            for (size, bg) in &self.scan {
-                let (x, y) = groups2d(size.div_ceil(SCAN_BLOCK));
-                pass.set_pipeline(&pipes.scan.pipes[0]);
-                pass.set_bind_group(0, bg, &[]);
-                pass.dispatch_workgroups(x, y, 1);
+            // one compute pass per stage, so the first step can be timed stage by stage
+            let mut stage = 0u32;
+            let begin = |enc: &mut wgpu::CommandEncoder, stage: &mut u32| -> wgpu::ComputePass<'static> {
+                let tw = match &self.prof {
+                    Some(p) if step == 0 => Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &p.set,
+                        beginning_of_pass_write_index: Some(2 * *stage),
+                        end_of_pass_write_index: Some(2 * *stage + 1),
+                    }),
+                    _ => None,
+                };
+                *stage += 1;
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("stage"),
+                    timestamp_writes: tw,
+                })
+                .forget_lifetime()
+            };
+            {
+                let mut pass = begin(&mut enc, &mut stage);
+                dispatch(&mut pass, &sort[0], &self.sort_bg, n);
             }
-            for (size, bg) in self.scan.iter().rev().skip(1) {
-                let (x, y) = groups2d(size.div_ceil(SCAN_BLOCK));
-                pass.set_pipeline(&pipes.scan.pipes[1]);
-                pass.set_bind_group(0, bg, &[]);
-                pass.dispatch_workgroups(x, y, 1);
+            {
+                // prefix sum up the levels, then add block offsets back down
+                let mut pass = begin(&mut enc, &mut stage);
+                for (size, bg) in &self.scan {
+                    let (x, y) = groups2d(size.div_ceil(SCAN_BLOCK));
+                    pass.set_pipeline(&pipes.scan.pipes[0]);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(x, y, 1);
+                }
+                for (size, bg) in self.scan.iter().rev().skip(1) {
+                    let (x, y) = groups2d(size.div_ceil(SCAN_BLOCK));
+                    pass.set_pipeline(&pipes.scan.pipes[1]);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(x, y, 1);
+                }
             }
-            dispatch(&mut pass, &sort[1], &self.sort_bg, n);
-            dispatch(&mut pass, &sort[2], &self.sort_bg, self.t);
-            dispatch(&mut pass, &sort[3], &self.sort_bg, n);
-            if !self.exact {
-                dispatch(&mut pass, &pm_pipes[0], &self.pm_bg, n);
-                pass.set_pipeline(&pm_pipes[1]);
-                pass.dispatch_workgroups(m as u32, 1, 1);
-                pass.set_pipeline(&pm_pipes[2]);
-                pass.dispatch_workgroups(l as u32, 1, 1);
-                pass.set_pipeline(&pm_pipes[3]);
-                pass.dispatch_workgroups(m as u32, 1, 1);
+            dispatch(&mut begin(&mut enc, &mut stage), &sort[1], &self.sort_bg, n);
+            dispatch(&mut begin(&mut enc, &mut stage), &sort[2], &self.sort_bg, self.t);
+            dispatch(&mut begin(&mut enc, &mut stage), &sort[3], &self.sort_bg, n);
+            {
+                let mut pass = begin(&mut enc, &mut stage);
+                if !self.exact {
+                    dispatch(&mut pass, &pm_pipes[0], &self.pm_bg, n);
+                }
             }
-            dispatch(&mut pass, &pipes.step.pipes[0], &self.step_bg, n);
-            if su.hole_count > 0 {
-                pass.set_pipeline(&pipes.holes.pipes[0]);
-                pass.set_bind_group(0, &self.holes_bg, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
+            {
+                let mut pass = begin(&mut enc, &mut stage);
+                if !self.exact {
+                    pass.set_bind_group(0, &self.pm_bg, &[]);
+                    pass.set_pipeline(&pm_pipes[1]);
+                    pass.dispatch_workgroups(m as u32, 1, 1);
+                    pass.set_pipeline(&pm_pipes[2]);
+                    pass.dispatch_workgroups(l as u32, 1, 1);
+                    pass.set_pipeline(&pm_pipes[3]);
+                    pass.dispatch_workgroups(m as u32, 1, 1);
+                }
             }
+            dispatch(&mut begin(&mut enc, &mut stage), &pipes.step.pipes[0], &self.step_bg, n);
+            {
+                let mut pass = begin(&mut enc, &mut stage);
+                if su.hole_count > 0 {
+                    pass.set_pipeline(&pipes.holes.pipes[0]);
+                    pass.set_bind_group(0, &self.holes_bg, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+            }
+            debug_assert_eq!(stage as usize, STAGES.len());
+        }
+        if profiling && steps > 0 {
+            let p = self.prof.as_ref().unwrap();
+            let q = 2 * STAGES.len() as u32;
+            enc.resolve_query_set(&p.set, 0..q, &p.resolve, 0);
+            enc.copy_buffer_to_buffer(&p.resolve, 0, &p.read, 0, q as u64 * 8);
+            self.prof_pending = true;
         }
         enc.finish()
+    }
+
+    /// Turns per-stage GPU timing on (if the device has timestamp queries).
+    pub fn enable_profiling(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return false;
+        }
+        if self.prof.is_none() {
+            let q = 2 * STAGES.len() as u32;
+            let set = device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("stage timing"),
+                ty: wgpu::QueryType::Timestamp,
+                count: q,
+            });
+            let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timing resolve"),
+                size: q as u64 * 8,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let read = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timing read"),
+                size: q as u64 * 8,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.prof = Some(Profiler {
+                set,
+                resolve,
+                read,
+                period_ns: queue.get_timestamp_period(),
+            });
+        }
+        true
+    }
+
+    /// Milliseconds per stage of the last profiled step (blocks on the GPU).
+    pub fn stage_ms(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Vec<(&'static str, f64)>> {
+        if !self.prof_pending {
+            return None;
+        }
+        self.prof_pending = false;
+        let p = self.prof.as_ref()?;
+        let ts: Vec<u64> = World::read(device, queue, &p.read, 2 * STAGES.len());
+        if ts.len() < 2 * STAGES.len() {
+            return None;
+        }
+        Some(
+            STAGES
+                .iter()
+                .enumerate()
+                .map(|(i, &name)| {
+                    let d = ts[2 * i + 1].saturating_sub(ts[2 * i]);
+                    (name, d as f64 * p.period_ns as f64 / 1e6)
+                })
+                .collect(),
+        )
+    }
+
+    /// Particles in the fullest hash bucket, and how many particles sit in buckets of more than
+    /// `crowd` (after the last step's sort). Slow; for diagnostics.
+    pub fn crowding(&self, device: &wgpu::Device, queue: &wgpu::Queue, crowd: u32) -> (u32, usize) {
+        let ends: Vec<u32> = World::read(device, queue, &self.counts, self.t);
+        let mut prev = 0u32;
+        let (mut max, mut crowded) = (0u32, 0usize);
+        for &e in &ends {
+            let c = e.saturating_sub(prev);
+            prev = e;
+            max = max.max(c);
+            if c > crowd {
+                crowded += c as usize;
+            }
+        }
+        (max, crowded)
     }
 
     /// Reads a buffer back (slow; for tests and checks).

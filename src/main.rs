@@ -27,6 +27,8 @@ Gravity Sandbox
       --seed S       (default 1)
       --out FILE     (default preview.png)
   gravity-sandbox --bench [N ...]     time one physics step at several particle counts
+      --preset P     scene (default galaxies)
+      --warm S       let the scene evolve S steps first (clumps form; default 0)
   gravity-sandbox --gravcheck [N]     compare grid gravity with the exact sum (fails above 5%)
 ";
 
@@ -66,13 +68,21 @@ fn real_main(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     if args.iter().any(|a| a == "--bench") {
-        let sizes: Vec<usize> = args.iter().filter_map(|a| a.parse().ok()).collect();
+        let warm: usize = get("--warm").map_or(Ok(0), |v| v.parse().map_err(|_| format!("bad --warm {v}")))?;
+        let preset_name = get("--preset").unwrap_or_else(|| "galaxies".into());
+        let preset = Preset::from_name(&preset_name).ok_or(format!("unknown preset {preset_name}"))?;
+        let sizes: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i == 0 || !matches!(args[i - 1].as_str(), "--warm" | "--preset"))
+            .filter_map(|(_, a)| a.parse().ok())
+            .collect();
         let sizes = if sizes.is_empty() {
             vec![16384, 65536, 262_144, 1_048_576, 4_194_304, 16_777_216]
         } else {
             sizes
         };
-        return headless::bench(&sizes);
+        return headless::bench(&sizes, preset, warm);
     }
     if args.iter().any(|a| a == "--preview") {
         let num = |name: &str, d: usize| -> Result<usize, String> {

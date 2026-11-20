@@ -34,7 +34,7 @@ pub async fn open(
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("gravity-sandbox"),
-            required_features: wgpu::Features::empty(),
+            required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
             required_limits: limits,
             ..Default::default()
         })
