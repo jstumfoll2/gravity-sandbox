@@ -8,8 +8,11 @@ OpenGL ES 3.1 compute shaders. No network permission, no ads, no tracking.
 
 ## Install
 
-Every push builds a debug APK in GitHub Actions. Open the latest run under
-**Actions**, download the `gravity-sandbox-apk` artifact, unzip, install.
+On the phone, open
+[the latest APK](https://github.com/jstumfoll2/gravity-sandbox/releases/download/latest/gravity-sandbox-latest.apk)
+(or the **Latest build** release on the repo page) and tap the APK.
+Every push to `main` refreshes it. Each Actions run also keeps the APK as the
+`gravity-sandbox-apk` artifact (a zip).
 All builds share one public debug key, so a new build installs over the old one.
 
 Needs a GPU with OpenGL ES 3.1 (most phones from 2016 on).
