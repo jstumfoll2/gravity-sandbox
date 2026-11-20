@@ -1,56 +1,15 @@
 //! Owns the GPU state and runs the simulation: the port of the Android SimRenderer.
 
 use crate::params::{P, Params};
-use crate::presets::{self, DEAD, Hole, Particle, Preset};
+use crate::physics::{self, HolesU, MAX_HOLES, MAX_TOUCH, N_REF, Pipelines, SimU, World};
+use crate::presets::{self, Hole, Preset, State};
 use crate::recording::{self, InputEvent, Kind, Mode, Recording};
 use crate::rng::Rng;
 use std::collections::HashMap;
 use std::time::Instant;
-use wgpu::util::DeviceExt;
 
-pub const TILE: usize = 256;
-pub const MAX_HOLES: usize = 16;
-pub const MAX_TOUCH: usize = 10;
-const STRIDE: u64 = 32;
 const HOLE_SOFT2: f32 = 0.25;
 pub const TRAIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct StepU {
-    count: u32,
-    hole_count: u32,
-    touch_count: u32,
-    _pad0: u32,
-    dt: f32,
-    g: f32,
-    soft2: f32,
-    h: f32,
-    k: f32,
-    visc: f32,
-    drag: f32,
-    hole_soft2: f32,
-    bound: f32,
-    heat_gain: f32,
-    heat_decay: f32,
-    _pad1: f32,
-    touch: [[f32; 4]; MAX_TOUCH],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct HolesU {
-    count: u32,
-    hole_count: u32,
-    _pad0: [u32; 2],
-    dt: f32,
-    g: f32,
-    hole_soft2: f32,
-    radius_per_mass: f32,
-    min_radius: f32,
-    bound: f32,
-    _pad1: [f32; 2],
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -80,26 +39,15 @@ struct Pointer {
     vy: f32,
 }
 
-struct Buffers {
-    parts: [wgpu::Buffer; 2],
-    holes: wgpu::Buffer,
-    absorb: wgpu::Buffer,
-    step_bg: [wgpu::BindGroup; 2],
-    holes_bg: [wgpu::BindGroup; 2],
-}
-
 pub struct Sim {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    step_pipe: wgpu::ComputePipeline,
-    holes_pipe: wgpu::ComputePipeline,
+    pipes: Pipelines,
     fade_pipe: wgpu::RenderPipeline,
     part_pipe: wgpu::RenderPipeline,
     present_pipe: wgpu::RenderPipeline,
     hole_pipe: wgpu::RenderPipeline,
     bgl_tex: wgpu::BindGroupLayout,
-    step_u: wgpu::Buffer,
-    holes_u: wgpu::Buffer,
     render_u: wgpu::Buffer,
     u_bg: wgpu::BindGroup,
     sampler: wgpu::Sampler,
@@ -107,7 +55,8 @@ pub struct Sim {
     tex_bg: wgpu::BindGroup,
     clear_trail: bool,
     srgb_out: bool,
-    bufs: Option<Buffers>,
+    world: Option<World>,
+    spawn_batch: Vec<State>,
 
     pub width: u32,
     pub height: u32,
@@ -121,8 +70,6 @@ pub struct Sim {
     pub mode: Mode,
     pub paused: bool,
     capacity: usize,
-    cur: usize,
-    cursor: usize,
     holes_used: usize,
     hole_next: usize,
     pub preset: Preset,
@@ -158,22 +105,7 @@ impl Sim {
         height: u32,
         gpu_info: String,
     ) -> Sim {
-        let compute = |src: &str, label: &str| {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(src.into()),
-            });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(label),
-                layout: None,
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        let step_pipe = compute(include_str!("../shaders/step.wgsl"), "step");
-        let holes_pipe = compute(include_str!("../shaders/holes.wgsl"), "holes");
+        let pipes = Pipelines::new(&device);
 
         let render_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"),
@@ -224,20 +156,31 @@ impl Sim {
             immediate_size: 0,
         });
 
-        let instance_layout = wgpu::VertexBufferLayout {
-            array_stride: STRIDE,
+        // particles: state (x, y, vx, vy) and packed (heat, density), struct-of-arrays
+        let part_layout = [
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 16,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x4],
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: 4,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![1 => Uint32],
+            }),
+        ];
+        let hole_layout = [Some(wgpu::VertexBufferLayout {
+            array_stride: 32,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
-        };
+        })];
         let pipe = |label: &str,
                     layout: &wgpu::PipelineLayout,
                     vs: &str,
                     fs: &str,
-                    instanced: bool,
+                    buffers: &[Option<wgpu::VertexBufferLayout>],
                     format: wgpu::TextureFormat,
                     blend: Option<wgpu::BlendState>| {
-            let inst = [Some(instance_layout.clone())];
-            let buffers: &[Option<wgpu::VertexBufferLayout>] = if instanced { &inst } else { &[] };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
@@ -284,7 +227,7 @@ impl Sim {
             &layout_u,
             "vs_fullscreen",
             "fs_fade",
-            false,
+            &[],
             TRAIL_FORMAT,
             Some(fade_blend),
         );
@@ -293,7 +236,7 @@ impl Sim {
             &layout_u,
             "vs_particle",
             "fs_particle",
-            true,
+            &part_layout,
             TRAIL_FORMAT,
             Some(additive),
         );
@@ -302,7 +245,7 @@ impl Sim {
             &layout_tex,
             "vs_fullscreen",
             "fs_present",
-            false,
+            &[],
             output_format,
             None,
         );
@@ -311,7 +254,7 @@ impl Sim {
             &layout_u,
             "vs_hole",
             "fs_hole",
-            true,
+            &hole_layout,
             output_format,
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
@@ -324,8 +267,6 @@ impl Sim {
                 mapped_at_creation: false,
             })
         };
-        let step_u = ubuf("step u", std::mem::size_of::<StepU>());
-        let holes_u = ubuf("holes u", std::mem::size_of::<HolesU>());
         let render_u = ubuf("render u", std::mem::size_of::<RenderU>());
         let u_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("render u"),
@@ -345,15 +286,12 @@ impl Sim {
         let mut sim = Sim {
             device,
             queue,
-            step_pipe,
-            holes_pipe,
+            pipes,
             fade_pipe,
             part_pipe,
             present_pipe,
             hole_pipe,
             bgl_tex,
-            step_u,
-            holes_u,
             render_u,
             u_bg,
             sampler,
@@ -361,7 +299,8 @@ impl Sim {
             tex_bg,
             clear_trail: true,
             srgb_out: output_format.is_srgb(),
-            bufs: None,
+            world: None,
+            spawn_batch: Vec::new(),
             width: width.max(1),
             height: height.max(1),
             half_w: 100.0,
@@ -372,8 +311,6 @@ impl Sim {
             mode: Mode::Spawn,
             paused: false,
             capacity: 0,
-            cur: 0,
-            cursor: 0,
             holes_used: 0,
             hole_next: 0,
             preset: Preset::Disk,
@@ -438,106 +375,46 @@ impl Sim {
         self.preset = preset;
         self.seed = seed;
         self.rnd = Rng::new(seed ^ 0x5DEE_CE66D);
-        let count = self.params.get(P::Count) as usize;
-        self.capacity = (count / TILE).max(1) * TILE;
-        let scene = presets::build(
+        let want = (self.params.get(P::Count) as usize / 256).max(4) * 256;
+        let m = (self.params.get(P::Grid) as usize)
+            .next_power_of_two()
+            .clamp(256, self.max_grid());
+        let cap = self.max_particles();
+        let mut n = want.min(cap);
+        let exact_below = self.params.get(P::ExactBelow) as usize;
+        self.world = None;
+        loop {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let w = World::new(&self.device, &self.queue, &mut self.pipes, n, m, n <= exact_below);
+            if pollster::block_on(scope.pop()).is_none() {
+                self.world = Some(w);
+                break;
+            }
+            drop(w);
+            if n <= 4096 {
+                panic!("out of GPU memory even at {n} particles");
+            }
+            n = (n / 2 / 256) * 256;
+        }
+        if n < want {
+            self.say(format!(
+                "{} particles would not fit this GPU; using {}",
+                group(want),
+                group(n)
+            ));
+        }
+        self.capacity = n;
+        let w = self.world.as_ref().unwrap();
+        w.upload_scene(&self.queue, preset, seed, self.params.get(P::G));
+        let scene_holes = presets::holes(
             preset,
-            self.capacity,
-            seed,
-            self.params.get(P::G),
             self.params.get(P::HoleRadius),
             self.params.get(P::HoleMinRadius),
         );
-        let d = &self.device;
-        let part = |label| {
-            d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(&scene.particles),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            })
-        };
-        let parts = [part("particles A"), part("particles B")];
-        let holes = d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("holes"),
-            contents: bytemuck::cast_slice(&[DEAD; MAX_HOLES]),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::VERTEX
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-        });
-        let absorb = d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("absorb"),
-            contents: bytemuck::cast_slice(&[0i32; MAX_HOLES * 3]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-        let step_bgl = self.step_pipe.get_bind_group_layout(0);
-        let holes_bgl = self.holes_pipe.get_bind_group_layout(0);
-        let step_bg = |s: usize| {
-            d.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("step"),
-                layout: &step_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: parts[s].as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: parts[1 - s].as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: holes.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: absorb.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: self.step_u.as_entire_binding(),
-                    },
-                ],
-            })
-        };
-        // holes pass reads the buffer the step just wrote
-        let holes_bg = |s: usize| {
-            d.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("holes"),
-                layout: &holes_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: parts[1 - s].as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: holes.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: absorb.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: self.holes_u.as_entire_binding(),
-                    },
-                ],
-            })
-        };
-        let bufs = Buffers {
-            step_bg: [step_bg(0), step_bg(1)],
-            holes_bg: [holes_bg(0), holes_bg(1)],
-            parts,
-            holes,
-            absorb,
-        };
-        self.bufs = Some(bufs);
-        self.cur = 0;
-        self.cursor = scene.used % self.capacity;
+        self.spawn_batch.clear();
         self.holes_used = 0;
         self.hole_next = 0;
-        for h in scene.holes {
+        for h in scene_holes {
             self.write_hole(h);
         }
         self.pointers.clear();
@@ -855,7 +732,6 @@ impl Sim {
     }
 
     fn apply_spawners(&mut self) {
-        let m = presets::particle_mass(self.capacity);
         let rate = (self.params.get(P::SpawnRate) as usize).clamp(1, 400);
         let spread = self.params.get(P::SpawnSpread);
         let fling = self.params.get(P::Fling);
@@ -872,7 +748,6 @@ impl Sim {
         for id in ids {
             let p = &self.pointers[&id];
             let (x0, y0, x1, y1, pvx, pvy) = (p.px, p.py, p.x, p.y, p.vx, p.vy);
-            let mut batch = Vec::with_capacity(rate);
             for _ in 0..rate {
                 let t = self.rnd.f32();
                 let x = x0 + (x1 - x0) * t + self.rnd.gaussian() * spread;
@@ -885,53 +760,42 @@ impl Sim {
                     vx += -y / r * vc;
                     vy += x / r * vc;
                 }
-                batch.push(Particle {
-                    pos: [x, y, m, 1.0],
-                    vel: [vx, vy, 0.0, 0.0],
-                });
+                self.spawn_batch.push([x, y, vx, vy]);
             }
-            self.write_particles(&batch);
-        }
-    }
-
-    /// Writes particles into the ring, wrapping around the end (oldest spawned get recycled).
-    fn write_particles(&mut self, batch: &[Particle]) {
-        let Some(b) = &self.bufs else { return };
-        let mut done = 0;
-        while done < batch.len() {
-            let chunk = (batch.len() - done).min(self.capacity - self.cursor);
-            self.queue.write_buffer(
-                &b.parts[self.cur],
-                self.cursor as u64 * STRIDE,
-                bytemuck::cast_slice(&batch[done..done + chunk]),
-            );
-            self.cursor = (self.cursor + chunk) % self.capacity;
-            done += chunk;
         }
     }
 
     fn write_hole(&mut self, h: Hole) {
-        let Some(b) = &self.bufs else { return };
+        let Some(w) = &self.world else { return };
         let slot = self.hole_next;
         self.hole_next = (self.hole_next + 1) % MAX_HOLES;
         self.holes_used = self.holes_used.max(slot + 1);
-        self.queue
-            .write_buffer(&b.holes, slot as u64 * STRIDE, bytemuck::bytes_of(&h));
-        self.queue
-            .write_buffer(&b.absorb, slot as u64 * 12, bytemuck::cast_slice(&[0i32; 3]));
+        w.write_hole(&self.queue, slot, h);
     }
 
     /// Runs `steps` physics steps in one submission.
     pub fn run_steps(&mut self, steps: usize) {
-        let Some(b) = &self.bufs else { return };
+        let Some(w) = &mut self.world else { return };
         let pr = &self.params;
-        let mut su = StepU {
-            count: self.capacity as u32,
+        let n = w.n as f32;
+        let mass = presets::particle_mass(w.n);
+        let g = pr.get(P::G);
+        // contacts: keep about the same number of neighbours per particle at any N
+        let h = pr.get(P::H) * (N_REF / n).sqrt().min(1.0);
+        let half = pr.get(P::Bound) * 1.02;
+        let mut su = SimU {
+            n: w.n as u32,
+            t: w.t as u32,
+            m_grid: w.m as u32,
             hole_count: self.holes_used as u32,
+            exact: w.exact as u32,
             dt: pr.get(P::Dt),
-            g: pr.get(P::G),
+            g,
+            mass,
+            gm: g * mass,
             soft2: pr.get(P::Soft) * pr.get(P::Soft),
-            h: pr.get(P::H),
+            h,
+            inv_cell: 1.0 / h,
             k: pr.get(P::K),
             visc: pr.get(P::Visc),
             drag: pr.get(P::Drag),
@@ -939,6 +803,8 @@ impl Sim {
             bound: pr.get(P::Bound),
             heat_gain: pr.get(P::HeatGain),
             heat_decay: pr.get(P::HeatDecay),
+            grid_origin: -half,
+            grid_inv: w.m as f32 / (2.0 * half),
             ..Default::default()
         };
         // pointers that pull or push
@@ -958,56 +824,48 @@ impl Sim {
             su.touch_count += 1;
         }
         let hu = HolesU {
-            count: self.capacity as u32,
             hole_count: self.holes_used as u32,
             dt: pr.get(P::Dt),
-            g: pr.get(P::G),
+            g,
             hole_soft2: HOLE_SOFT2,
             radius_per_mass: pr.get(P::HoleRadius),
             min_radius: pr.get(P::HoleMinRadius),
             bound: pr.get(P::Bound),
+            mass,
+            gm: g * mass,
             ..Default::default()
         };
-        self.queue.write_buffer(&self.step_u, 0, bytemuck::bytes_of(&su));
-        self.queue.write_buffer(&self.holes_u, 0, bytemuck::bytes_of(&hu));
-
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("step") });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("step"),
-                timestamp_writes: None,
-            });
-            for _ in 0..steps {
-                pass.set_pipeline(&self.step_pipe);
-                pass.set_bind_group(0, &b.step_bg[self.cur], &[]);
-                pass.dispatch_workgroups((self.capacity / TILE) as u32, 1, 1);
-                if self.holes_used > 0 {
-                    pass.set_pipeline(&self.holes_pipe);
-                    pass.set_bind_group(0, &b.holes_bg[self.cur], &[]);
-                    pass.dispatch_workgroups(1, 1, 1);
-                }
-                self.cur = 1 - self.cur;
-            }
-        }
-        self.queue.submit([enc.finish()]);
+        let cb = w.encode(
+            &self.device,
+            &self.queue,
+            &mut self.pipes,
+            &su,
+            &hu,
+            &self.spawn_batch,
+            steps,
+        );
+        self.spawn_batch.clear();
+        self.queue.submit([cb]);
     }
 
     /// Draws into the trail target, then tone-maps it and the black holes onto `target`.
     pub fn render(&mut self, enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
-        let Some(b) = &self.bufs else { return };
+        let Some(world) = &self.world else { return };
         let (w, h) = (self.width as f32, self.height as f32);
+        // fewer, smaller and dimmer points as N grows, so the total light stays about the same
+        let n_scale = (N_REF / self.capacity as f32).min(1.0);
+        let size = (self.params.get(P::PointPx) * w.min(h) / 720.0).max(1.0);
+        let size_eff = (size * n_scale.powf(0.25)).max(1.0);
         let pr = &self.params;
         let ru = RenderU {
             scale: [1.0 / self.half_w, 1.0 / self.half_h],
             center: self.center,
             viewport: [w, h],
-            point_px: pr.get(P::PointPx) * w.min(h) / 720.0,
+            point_px: size_eff,
             px_per_unit: w / (2.0 * self.half_w),
             dens_glow: pr.get(P::DensGlow),
             heat_scale: 0.05,
-            brightness: pr.get(P::Brightness),
+            brightness: pr.get(P::Brightness) * n_scale * (size / size_eff).powi(2),
             keep: pr.get(P::Trails),
             exposure: pr.get(P::Exposure),
             srgb_out: if self.srgb_out { 1.0 } else { 0.0 },
@@ -1044,7 +902,8 @@ impl Sim {
             pass.draw(0..3, 0..1);
             // particles, additive
             pass.set_pipeline(&self.part_pipe);
-            pass.set_vertex_buffer(0, b.parts[self.cur].slice(..));
+            pass.set_vertex_buffer(0, world.state[0].slice(..));
+            pass.set_vertex_buffer(1, world.aux[0].slice(..));
             pass.draw(0..6, 0..self.capacity as u32);
         }
         {
@@ -1071,7 +930,7 @@ impl Sim {
             // black holes on top, drawn crisp (no trails)
             if self.holes_used > 0 {
                 pass.set_pipeline(&self.hole_pipe);
-                pass.set_vertex_buffer(0, b.holes.slice(..));
+                pass.set_vertex_buffer(0, world.holes.slice(..));
                 pass.draw(0..6, 0..self.holes_used as u32);
             }
         }
@@ -1086,7 +945,18 @@ impl Sim {
             return;
         }
         let fps = self.frames_since_stats as f64 / el;
-        let mut s = format!("{fps:.0} fps · {} particles", group(self.capacity));
+        let mut s = format!(
+            "{fps:.0} fps · {} particles · {}",
+            group(self.capacity),
+            match &self.world {
+                Some(w) if w.exact => "exact gravity".to_string(),
+                Some(w) => format!("grid {}²", w.m),
+                None => String::new(),
+            }
+        );
+        if let Some(w) = &self.world {
+            s += &format!(" · ~{:.2} GB", physics::bytes_needed(w.n, w.m) as f64 / 1e9);
+        }
         if self.gpu_ms_n > 0 {
             s += &format!(" · physics {:.2} ms/step", self.gpu_ms_acc / self.gpu_ms_n as f64);
         }
@@ -1114,33 +984,69 @@ impl Sim {
     }
 
     fn report_bench(&mut self) {
-        if let Some(text) = bench_summary(self.capacity, &mut self.bench_ms) {
+        if let Some(mut text) = bench_summary(self.capacity, self.is_exact(), &mut self.bench_ms) {
+            if let Some(st) = self.profile_step() {
+                text += &format!("\n{}", stage_summary(&st));
+            }
+            let (max, crowded) = self.crowding();
+            text += &format!("\nfullest cell {max}, {} particles in cells over 64", group(crowded));
+            eprintln!("{text}");
             self.say(text);
         }
     }
 
     /// Reads the black holes back (slow; for tests).
     pub fn read_holes(&self) -> Vec<Hole> {
-        let Some(b) = &self.bufs else { return vec![] };
-        let size = (MAX_HOLES as u64) * STRIDE;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("holes readback"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(&b.holes, 0, &staging, 0, size);
-        self.queue.submit([enc.finish()]);
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        let out = match slice.get_mapped_range() {
-            Ok(data) => bytemuck::cast_slice::<u8, Hole>(&data)[..self.holes_used].to_vec(),
-            Err(_) => vec![],
-        };
-        staging.unmap();
-        out
+        let Some(w) = &self.world else { return vec![] };
+        let mut v: Vec<Hole> = World::read(&self.device, &self.queue, &w.holes, MAX_HOLES);
+        v.truncate(self.holes_used);
+        v
+    }
+
+    /// Reads the live particle state back (slow; for checks).
+    pub fn read_state(&self) -> Vec<State> {
+        let Some(w) = &self.world else { return vec![] };
+        World::read(&self.device, &self.queue, &w.state[0], w.n)
+    }
+
+    /// Runs one step with per-stage GPU timestamps; returns "stage ms" pairs, or None if the
+    /// GPU has no timestamp queries.
+    pub fn profile_step(&mut self) -> Option<Vec<(&'static str, f64)>> {
+        let w = self.world.as_mut()?;
+        if !w.enable_profiling(&self.device, &self.queue) {
+            return None;
+        }
+        self.run_steps(1);
+        let w = self.world.as_mut()?;
+        w.stage_ms(&self.device, &self.queue)
+    }
+
+    /// (fullest hash bucket, particles in buckets of more than 64).
+    pub fn crowding(&self) -> (u32, usize) {
+        self.world
+            .as_ref()
+            .map_or((0, 0), |w| w.crowding(&self.device, &self.queue, 64))
+    }
+
+    pub fn is_exact(&self) -> bool {
+        self.world.as_ref().is_some_and(|w| w.exact)
+    }
+
+    /// Largest grid whose FFT rows (2M complex values, 16 bytes per node) fit in workgroup memory.
+    fn max_grid(&self) -> usize {
+        let bytes = self.device.limits().max_compute_workgroup_storage_size as usize;
+        let m = (bytes / 16).max(256);
+        // round down to a power of two
+        (1usize << (usize::BITS - 1 - m.leading_zeros())).clamp(256, 2048)
+    }
+
+    /// Particles the device limits allow (memory itself is checked when allocating).
+    fn max_particles(&self) -> usize {
+        let l = self.device.limits();
+        let per_binding = l.max_storage_buffer_binding_size.min(l.max_buffer_size) as usize;
+        let by_state = per_binding / 16;
+        let by_table = (per_binding / 4 - 1).next_power_of_two() / 2;
+        (by_state.min(by_table).min(crate::params::MAX_COUNT as usize) / 256) * 256
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -1152,22 +1058,33 @@ impl Sim {
     }
 }
 
-/// "N=…: median … ms/step, p90 …, … G pairs/s"
-pub fn bench_summary(capacity: usize, ms: &mut [f64]) -> Option<String> {
+/// "N=…: median … ms/step, p90 …, … M particle-steps/s"
+pub fn bench_summary(capacity: usize, exact: bool, ms: &mut [f64]) -> Option<String> {
     if ms.is_empty() {
         return None;
     }
     ms.sort_by(|a, b| a.total_cmp(b));
     let med = ms[ms.len() / 2];
     let p90 = ms[(ms.len() * 9) / 10];
-    let pairs = capacity as f64 * capacity as f64 / (med / 1000.0) / 1e9;
+    let rate = capacity as f64 / (med / 1000.0) / 1e6;
     Some(format!(
-        "N={}: median {med:.2} ms/step, p90 {p90:.2} ms, {pairs:.1} G pairs/s",
-        group(capacity)
+        "N={}: median {med:.2} ms/step, p90 {p90:.2} ms, {rate:.1} M particle-steps/s ({})",
+        group(capacity),
+        if exact { "exact gravity" } else { "grid gravity" },
     ))
 }
 
-fn group(n: usize) -> String {
+/// "hash 0.12 · scan 0.05 · …" in ms.
+pub fn stage_summary(st: &[(&str, f64)]) -> String {
+    st.iter()
+        .filter(|(_, ms)| *ms > 0.0005)
+        .map(|(name, ms)| format!("{name} {ms:.2}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+        + " ms"
+}
+
+pub fn group(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

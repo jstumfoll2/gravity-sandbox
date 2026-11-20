@@ -155,14 +155,22 @@ pub fn selftest() -> Result<(), String> {
     Ok(())
 }
 
-/// Physics cost per step for a range of particle counts.
-pub fn bench(sizes: &[usize]) -> Result<(), String> {
+/// Physics cost per step for a range of particle counts, after `warm` steps of evolution
+/// (crowded clumps form over time), with a per-stage breakdown where the GPU supports it.
+pub fn bench(sizes: &[usize], preset: Preset, warm: usize) -> Result<(), String> {
     let mut s = make_sim(1024, 64, 64)?;
     for &n in sizes {
         s.params.set(P::Count, n as f32);
-        s.reset(Preset::Galaxies, 1);
+        s.reset(preset, 1);
+        let mut done = 0;
+        while done < warm {
+            let k = (warm - done).min(8);
+            s.run_steps(k);
+            let _ = s.device().poll(wgpu::PollType::wait_indefinitely());
+            done += k;
+        }
         let mut ms = Vec::new();
-        for i in 0..40 {
+        for i in 0..30 {
             let _ = s.device().poll(wgpu::PollType::wait_indefinitely());
             let t = Instant::now();
             s.run_steps(1);
@@ -171,7 +179,60 @@ pub fn bench(sizes: &[usize]) -> Result<(), String> {
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
             }
         }
-        println!("{}", sim::bench_summary(s.capacity(), &mut ms).unwrap_or_default());
+        println!(
+            "{}",
+            sim::bench_summary(s.capacity(), s.is_exact(), &mut ms).unwrap_or_default()
+        );
+        if let Some(st) = s.profile_step() {
+            println!("    {}", sim::stage_summary(&st));
+        }
+        let (max, crowded) = s.crowding();
+        println!(
+            "    fullest cell {max}, {} particles in cells over 64 (after {warm} steps)",
+            sim::group(crowded)
+        );
     }
     Ok(())
+}
+
+/// Compares grid (particle-mesh) gravity with the exact all-pairs sum on the same particles:
+/// one step each from an identical start, against a G = 0 step, so contacts cancel out.
+/// Returns the RMS relative acceleration error.
+pub fn gravcheck(n: usize, grid: usize) -> Result<f64, String> {
+    let mut s = make_sim(n, 64, 64)?;
+    s.params.set(P::Grid, grid as f32);
+    let run = |s: &mut Sim, g: f32, exact: bool| {
+        s.params.set(P::G, g);
+        s.params.set(P::ExactBelow, if exact { 131072.0 } else { 0.0 });
+        s.reset(Preset::Cloud, 3);
+        s.run_steps(1);
+        s.read_state()
+    };
+    let g = s.params.get(P::G);
+    let base = run(&mut s, 0.0, false);
+    let exact = run(&mut s, g, true);
+    let grid_v = run(&mut s, g, false);
+    let dt = s.params.get(P::Dt) as f64;
+    let (mut err2, mut ref2, mut count) = (0.0f64, 0.0f64, 0usize);
+    for ((b, e), m) in base.iter().zip(&exact).zip(&grid_v) {
+        if b[0] > 1e5 || e[0] > 1e5 || m[0] > 1e5 {
+            continue;
+        }
+        for k in 2..4 {
+            let ae = (e[k] - b[k]) as f64 / dt;
+            let am = (m[k] - b[k]) as f64 / dt;
+            err2 += (am - ae) * (am - ae);
+            ref2 += ae * ae;
+        }
+        count += 1;
+    }
+    if count == 0 || ref2 == 0.0 {
+        return Err("no live particles to compare".into());
+    }
+    let rms = (err2 / ref2).sqrt();
+    println!(
+        "gravcheck N={n} grid {grid}: RMS relative acceleration error {:.2}% over {count} particles",
+        rms * 100.0
+    );
+    Ok(rms)
 }

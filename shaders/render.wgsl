@@ -52,21 +52,22 @@ fn palette(t: f32) -> vec3f {
 
 @vertex
 fn vs_particle(@builtin(vertex_index) vi: u32,
-               @location(0) pos: vec4f,     // x, y, mass, alive
-               @location(1) vel: vec4f) -> PartOut {  // vx, vy, heat, density
+               @location(0) st: vec4f,      // x, y, vx, vy
+               @location(1) aux: u32) -> PartOut {  // pack2x16float(heat, density)
     var o: PartOut;
     o.c = corner(vi);
-    if (pos.w < 0.5) {
+    if (st.x > 1.0e5) {
         o.clip = offscreen();
         o.color = vec3f(0.0);
         return o;
     }
-    let dens = vel.w;
-    let heat = vel.z * u.heat_scale;
+    let hd = unpack2x16float(aux);
+    let dens = hd.y;
+    let heat = hd.x * u.heat_scale;
     let t = clamp(0.15 * dens + heat, 0.0, 1.0);
     o.color = palette(t) * (1.0 + u.dens_glow * min(dens, 20.0));
-    let size = max(1.5, u.point_px * (1.0 + 0.08 * min(dens, 20.0)));
-    let cc = (pos.xy - u.center) * u.scale;
+    let size = max(1.0, u.point_px * (1.0 + 0.08 * min(dens, 20.0)));
+    let cc = (st.xy - u.center) * u.scale;
     o.clip = vec4f(cc + o.c * size / u.viewport, 0.0, 1.0);
     return o;
 }

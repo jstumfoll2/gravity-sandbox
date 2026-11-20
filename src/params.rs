@@ -9,6 +9,8 @@ pub enum P {
     Substeps,
     Drag,
     Bound,
+    Grid,
+    ExactBelow,
     H,
     K,
     Visc,
@@ -113,6 +115,9 @@ impl With for Param {
     }
 }
 
+/// Upper limit of the Particles slider; sized for an 8 GB GPU (about 56 bytes per particle).
+pub const MAX_COUNT: f32 = 100_000_000.0;
+
 pub const SECTIONS: [&str; 5] = ["Simulation", "Matter", "Black holes", "Mouse", "Look"];
 
 impl Params {
@@ -124,12 +129,12 @@ impl Params {
         const LOOK: &str = "Look";
         // Order must match enum P.
         let all = vec![
-            p("count", "Particles", 1024.0, 131072.0, 16384.0, SIM)
+            p("count", "Particles", 1024.0, MAX_COUNT, 1_048_576.0, SIM)
                 .log()
                 .int()
                 .step(1024.0)
                 .restart()
-                .help("All-pairs gravity costs N². Applies on reset."),
+                .help("Cost grows about linearly with N (grid gravity). Applies on reset; capped by GPU memory."),
             p("g", "Gravity G", 0.0, 150000.0, 40000.0, SIM).help("G × total mass of a preset"),
             p("soft", "Softening", 0.1, 6.0, 1.0, SIM)
                 .log()
@@ -139,10 +144,20 @@ impl Params {
             p("drag", "Drag", 0.0, 2.0, 0.0, SIM),
             p("bound", "World radius", 100.0, 2000.0, 600.0, SIM)
                 .log()
-                .help("Particles that fly further are removed"),
+                .help("Particles that fly further are removed. The gravity grid spans this."),
+            p("grid", "Gravity grid", 256.0, 2048.0, 1024.0, SIM)
+                .int()
+                .restart()
+                .help("Particle-mesh nodes per side (rounded to a power of two). Finer = sharper gravity, slower FFT."),
+            p("exactBelow", "Exact gravity up to", 0.0, 131072.0, 32768.0, SIM)
+                .log()
+                .int()
+                .step(1024.0)
+                .restart()
+                .help("At or below this many particles, gravity is the exact all-pairs sum instead of the grid"),
             p("h", "Contact radius", 0.2, 5.0, 1.5, MAT)
                 .log()
-                .help("Particles closer than this push apart and share momentum"),
+                .help("At 16k particles. Shrinks as 1/sqrt(N) so each particle keeps about as many neighbours."),
             p("k", "Pressure", 0.0, 200.0, 30.0, MAT).help("0 = pure collisionless gravity"),
             p("visc", "Viscosity", 0.0, 12.0, 2.0, MAT).help("Sticky collisions; lets clumps settle"),
             p("heatGain", "Heating", 0.0, 0.2, 0.02, MAT).help("Collisions heat matter (redder glow)"),
@@ -161,7 +176,8 @@ impl Params {
                 .help("Adds circular-orbit speed around the centre to new particles"),
             p("pull", "Pull / push force", 0.0, 6000.0, 1200.0, IN),
             p("pullRadius", "Pull radius", 3.0, 120.0, 30.0, IN).log(),
-            p("pointPx", "Particle size", 1.0, 14.0, 3.0, LOOK).help("At 720 px window height; scales with the window"),
+            p("pointPx", "Particle size", 1.0, 14.0, 3.0, LOOK)
+                .help("At 720 px window height and 16k particles; shrinks gently with more particles"),
             p("brightness", "Brightness", 0.02, 2.0, 0.35, LOOK).log(),
             p("exposure", "Exposure", 0.2, 6.0, 1.5, LOOK).log(),
             p("trails", "Trails", 0.0, 0.97, 0.55, LOOK),
@@ -232,6 +248,8 @@ mod tests {
         assert_eq!(p.all[P::GpuTiming as usize].key, "gpuTiming");
         assert_eq!(p.all[P::PullRadius as usize].key, "pullRadius");
         assert_eq!(p.all[P::HoleMass as usize].key, "holeMass");
+        assert_eq!(p.all[P::ExactBelow as usize].key, "exactBelow");
+        assert_eq!(p.all[P::H as usize].key, "h");
     }
 
     #[test]
@@ -239,9 +257,11 @@ mod tests {
         let mut a = Params::new();
         a.set(P::G, 1234.0);
         a.set(P::Count, 5000.0);
+        a.set(P::Grid, 512.0);
         let mut b = Params::new();
         b.load_text(&a.to_text());
         assert_eq!(b.get(P::G), 1234.0);
         assert_eq!(b.get(P::Count), 5120.0);
+        assert_eq!(b.get(P::Grid), 512.0);
     }
 }

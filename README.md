@@ -1,6 +1,6 @@
 # Gravity Sandbox
 
-Fling thousands of particles around with the mouse and watch gravity pull them into
+Fling millions of particles around with the mouse and watch gravity pull them into
 disks, planets and stars. Drop black holes and watch them feed.
 
 A hobby N-body simulation that runs on your GPU: Rust, [wgpu](https://wgpu.rs) compute shaders
@@ -43,24 +43,39 @@ or `~/.local/share/gravity-sandbox` (Linux).
 
 ## How the physics works
 
-* **State:** each particle is two `vec4`s: `(x, y, mass, alive)` and `(vx, vy, heat, density)`,
-  in two storage buffers that ping-pong every step (read A, write B, swap).
-* **Gravity:** an exact all-pairs sum with Plummer softening,
-  `a = G Σ m d / (r² + ε²)^{3/2}`, tiled through 256 entries of workgroup shared memory
-  (the GPU Gems 3 layout). Cost is N² per step, so ~8k particles is the comfortable default and
-  the Tune panel's benchmark reports ms/step and pair interactions per second for your GPU.
+* **State:** struct-of-arrays, 20 bytes per particle: `(x, y, vx, vy)` plus `(heat, density)`
+  packed as two f16. Every particle has the same mass, so it is not stored. Counting the cell-sorted
+  copy, sort keys and the hash table, a particle costs about 56 bytes of GPU memory: 100M (the
+  slider's limit, sized for an 8 GB card) is about 5.6 GB; 1B would need about 60 GB.
+* **Sort:** every step the particles are counting-sorted by hashed grid cell (hash, multi-level
+  prefix scan, scatter, a per-cell fix-up that makes the order deterministic, gather). After that a
+  cell's particles are contiguous in memory, which is what makes the passes below O(N) and
+  cache-friendly.
+* **Gravity:** particle-mesh. Mass is deposited cloud-in-cell onto an M×M grid (default 1024²,
+  spanning the world radius) with 64-bit integer atomics, convolved with the softened
+  `a = G Σ m d / (r² + ε²)^{3/2}` kernel by FFT on a zero-padded 2M×2M grid (isolated, not periodic),
+  and interpolated back. Both force components come out of one complex inverse FFT; each FFT row
+  lives in workgroup memory, so a whole 2-D convolution is three dispatches. The cost is O(N) plus a
+  fixed FFT. At or below *Exact gravity up to* (default 32k) particles it is the exact all-pairs
+  sum instead (tiled through workgroup memory). `--gravcheck` measures the grid against the exact
+  sum: about 0.2% RMS acceleration error on the 16k cloud.
 * **Matter:** within the contact radius `h`, particles push apart (`k (1 − r/h)`) and share
-  momentum through viscosity. That is what makes dust settle into solid clumps instead of
-  passing through itself, i.e. planets. Viscous work heats matter; dense, hot clumps glow
-  yellow-orange like stars.
-* **Black holes:** up to 16, updated in their own one-workgroup pass that sums the pull of all
-  particles. Particles inside the horizon are removed and their mass and momentum are added to
-  the hole with integer atomics (fixed point), so the result does not depend on thread order.
+  momentum through viscosity, found through the 3×3 hashed cells around each particle. That is what
+  makes dust settle into solid clumps instead of passing through itself, i.e. planets. Viscous work
+  heats matter; dense, hot clumps glow yellow-orange like stars. `h` is set for 16k particles and
+  shrinks as `1/√N`, so each particle keeps about as many neighbours at any count.
+* **Black holes:** up to 16. Each workgroup of the step reduces its particles' pull on every hole
+  and what each hole swallowed, then adds that with 64-bit integer atomics (fixed point), so the
+  result does not depend on thread order. A one-thread pass then integrates the holes.
   Holes that touch merge.
 * **Integration:** semi-implicit (symplectic) Euler at a fixed step, several steps per frame.
 * **Rendering:** additive sprites (instanced quads) into a 16-bit float target that fades each frame
-  (trails), then tone-mapped to the screen. The particle buffer is read directly as a vertex
-  buffer, so nothing is copied back to the CPU.
+  (trails), then tone-mapped to the screen. The particle buffers are read directly as vertex
+  buffers, so nothing is copied back to the CPU. Points get smaller and dimmer as N grows, so the
+  total light stays about the same.
+* **Spawning:** new matter goes into the free slots after the live particles (the sort keeps the
+  dead at the end); when the buffer is full it recycles live ones. Presets are generated in
+  independently seeded chunks on every CPU core and streamed to the GPU.
 
 ## Record and replay
 
@@ -74,8 +89,9 @@ settings on identical input. `gravity-sandbox --replay FILE` replays any saved r
 
 * `gravity-sandbox --preview --preset galaxies --n 4096 --steps 300 --out p.png` runs the real
   shaders headless and writes a PNG (CI does this on a software Vulkan driver).
-* `gravity-sandbox --bench 8192 16384 32768` prints ms per physics step and pair interactions per
-  second for your GPU.
+* `gravity-sandbox --bench 65536 1048576 16777216` prints ms per physics step and particle-steps
+  per second for your GPU (no arguments: 16k to 16M).
+* `gravity-sandbox --gravcheck` compares grid gravity with the exact all-pairs sum.
 * `gravity-sandbox --selftest` checks mouse-to-world mapping and black-hole placement end to end.
 
 ## Code

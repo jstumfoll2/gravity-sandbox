@@ -6,6 +6,7 @@ mod app;
 mod gpu;
 mod headless;
 mod params;
+mod physics;
 mod presets;
 mod recording;
 mod rng;
@@ -26,14 +27,16 @@ Gravity Sandbox
       --seed S       (default 1)
       --out FILE     (default preview.png)
   gravity-sandbox --bench [N ...]     time one physics step at several particle counts
+      --preset P     scene (default galaxies)
+      --warm S       let the scene evolve S steps first (clumps form; default 0)
+  gravity-sandbox --gravcheck [N]     compare grid gravity with the exact sum (fails above 5%)
 ";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args
-        .iter()
-        .any(|a| a == "--preview" || a == "--bench" || a == "--selftest" || a == "--help" || a == "-h")
-    {
+    if args.iter().any(|a| {
+        a == "--preview" || a == "--bench" || a == "--gravcheck" || a == "--selftest" || a == "--help" || a == "-h"
+    }) {
         attach_console();
     }
     if let Err(e) = real_main(&args) {
@@ -56,14 +59,30 @@ fn real_main(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--selftest") {
         return headless::selftest();
     }
+    if args.iter().any(|a| a == "--gravcheck") {
+        let n = args.iter().find_map(|a| a.parse().ok()).unwrap_or(16384);
+        let rms = headless::gravcheck(n, 1024)?;
+        if rms > 0.05 {
+            return Err(format!("grid gravity is off by {:.1}% RMS", rms * 100.0));
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--bench") {
-        let sizes: Vec<usize> = args.iter().filter_map(|a| a.parse().ok()).collect();
+        let warm: usize = get("--warm").map_or(Ok(0), |v| v.parse().map_err(|_| format!("bad --warm {v}")))?;
+        let preset_name = get("--preset").unwrap_or_else(|| "galaxies".into());
+        let preset = Preset::from_name(&preset_name).ok_or(format!("unknown preset {preset_name}"))?;
+        let sizes: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i == 0 || !matches!(args[i - 1].as_str(), "--warm" | "--preset"))
+            .filter_map(|(_, a)| a.parse().ok())
+            .collect();
         let sizes = if sizes.is_empty() {
-            vec![4096, 8192, 16384, 32768, 65536]
+            vec![16384, 65536, 262_144, 1_048_576, 4_194_304, 16_777_216]
         } else {
             sizes
         };
-        return headless::bench(&sizes);
+        return headless::bench(&sizes, preset, warm);
     }
     if args.iter().any(|a| a == "--preview") {
         let num = |name: &str, d: usize| -> Result<usize, String> {
