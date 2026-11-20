@@ -38,8 +38,10 @@ jobs:
           for p in galaxies disk rings cloud; do
             ./target/release/gravity-sandbox --preview --preset $p --n 4096 --steps 300 --out pc-preview-$p.png
           done
+          ./target/release/gravity-sandbox --preview --preset galaxies --n 262144 --steps 120 --out pc-preview-galaxies-256k.png
           ./target/release/gravity-sandbox --selftest
-          ./target/release/gravity-sandbox --bench 2048 4096 8192
+          ./target/release/gravity-sandbox --gravcheck 16384
+          ./target/release/gravity-sandbox --bench 4096 16384 65536 262144
       - uses: actions/upload-artifact@v4
         with:
           name: pc-preview
