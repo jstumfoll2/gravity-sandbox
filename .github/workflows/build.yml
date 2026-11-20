@@ -9,7 +9,108 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  rust-check:
+    name: Rust (fmt, clippy, tests, headless preview)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test
+      - name: Install a software Vulkan driver (lavapipe)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q mesa-vulkan-drivers
+      - name: Run the real WGSL shaders headless
+        run: |
+          cargo build --release
+          for p in galaxies disk rings cloud; do
+            ./target/release/gravity-sandbox --preview --preset $p --n 4096 --steps 300 --out pc-preview-$p.png
+          done
+          ./target/release/gravity-sandbox --selftest
+          ./target/release/gravity-sandbox --bench 2048 4096 8192
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pc-preview
+          path: pc-preview-*.png
+
+  pc:
+    name: PC build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            exe: gravity-sandbox.exe
+          - name: linux-x64
+            os: ubuntu-24.04
+            exe: gravity-sandbox
+          - name: macos-arm64
+            os: macos-latest
+            exe: gravity-sandbox
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/gravity-sandbox
+          cp target/release/${{ matrix.exe }} README.md LICENSE dist/gravity-sandbox/
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip ../gravity-sandbox-${{ matrix.name }}.zip gravity-sandbox >/dev/null
+          else
+            tar czf ../gravity-sandbox-${{ matrix.name }}.tar.gz gravity-sandbox
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gravity-sandbox-${{ matrix.name }}
+          path: gravity-sandbox-${{ matrix.name }}.*
+
+  pc-release:
+    name: Publish PC builds to the rolling "pc-latest" release (main only)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [pc, rust-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gravity-sandbox-*
+          merge-multiple: true
+          path: out
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l out
+          notes="Build #${GITHUB_RUN_NUMBER} from ${GITHUB_SHA::7}. Download the file for your OS, unpack, run gravity-sandbox."
+          git push -f origin "${GITHUB_SHA}:refs/tags/pc-latest"
+          if gh release view pc-latest >/dev/null 2>&1; then
+            gh release upload pc-latest out/* --clobber
+            gh release edit pc-latest --notes "$notes"
+          else
+            gh release create pc-latest out/* --prerelease --title "Latest PC build" --notes "$notes"
+          fi
+
   shaders:
     name: Shaders (glslang + headless preview)
     runs-on: ubuntu-24.04
