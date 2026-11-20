@@ -1,0 +1,122 @@
+#version 310 es
+// Updates the black holes (at most 16) in a single workgroup:
+// 1) every thread sums the pull of a slice of the particles on each hole,
+// 2) a tree reduction in shared memory,
+// 3) thread 0 adds swallowed mass and momentum, applies hole-hole gravity,
+//    merges holes that touch, and integrates.
+precision highp float;
+precision highp int;
+
+#define T 256
+#define MAX_HOLES 16
+layout(local_size_x = T) in;
+
+struct Particle { vec4 pos; vec4 vel; };
+layout(std430, binding = 0) readonly buffer Parts { Particle parts[]; };
+layout(std430, binding = 2) buffer Holes { vec4 holes[]; };
+layout(std430, binding = 3) buffer Absorb { int absorb[]; };
+
+uniform int uCount;
+uniform int uHoleCount;
+uniform float uDt;
+uniform float uG;
+uniform float uHoleSoft2;
+uniform float uRadiusPerMass;
+uniform float uMinRadius;
+uniform float uBound;
+
+const float MASS_FP = 1.0e7;
+const float MOM_FP = 1.0e5;
+
+shared vec2 sAcc[T];
+shared vec2 sHoleAcc[MAX_HOLES];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    for (int h = 0; h < uHoleCount; h++) {
+        vec4 hp = holes[2 * h];
+        vec2 a = vec2(0.0);
+        for (int i = int(lid); i < uCount; i += T) {
+            vec4 pp = parts[i].pos;
+            vec2 d = pp.xy - hp.xy;
+            float inv = inversesqrt(dot(d, d) + uHoleSoft2);
+            a += d * (pp.z * inv * inv * inv);
+        }
+        sAcc[lid] = a;
+        barrier();
+        for (uint s = uint(T / 2); s > 0u; s >>= 1) {
+            if (lid < s) sAcc[lid] += sAcc[lid + s];
+            barrier();
+        }
+        if (lid == 0u) sHoleAcc[h] = sAcc[0] * uG;
+        barrier();
+    }
+
+    if (lid != 0u) return;
+
+    // swallowed matter
+    for (int h = 0; h < uHoleCount; h++) {
+        vec4 hp = holes[2 * h];
+        vec4 hv = holes[2 * h + 1];
+        float dm = float(absorb[3 * h]) / MASS_FP;
+        vec2 dp = vec2(float(absorb[3 * h + 1]), float(absorb[3 * h + 2])) / MOM_FP;
+        absorb[3 * h] = 0; absorb[3 * h + 1] = 0; absorb[3 * h + 2] = 0;
+        if (hp.z > 0.0 && dm > 0.0) {
+            float mNew = hp.z + dm;
+            hv.xy = (hv.xy * hp.z + dp) / mNew;
+            hp.z = mNew;
+            hv.z += dm;   // running total swallowed, used for the glow
+            holes[2 * h] = hp;
+            holes[2 * h + 1] = hv;
+        }
+    }
+
+    // hole-hole gravity and mergers
+    for (int h = 0; h < uHoleCount; h++) {
+        vec4 hp = holes[2 * h];
+        if (hp.z <= 0.0) continue;
+        vec2 a = sHoleAcc[h];
+        for (int k = 0; k < uHoleCount; k++) {
+            if (k == h) continue;
+            vec4 kp = holes[2 * k];
+            if (kp.z <= 0.0) continue;
+            vec2 d = kp.xy - hp.xy;
+            float r2 = dot(d, d);
+            float rr = max(hp.w, kp.w);
+            if (r2 < rr * rr && hp.z >= kp.z) {
+                vec4 hv = holes[2 * h + 1];
+                vec4 kv = holes[2 * k + 1];
+                float mNew = hp.z + kp.z;
+                hv.xy = (hv.xy * hp.z + kv.xy * kp.z) / mNew;
+                hp.xy = (hp.xy * hp.z + kp.xy * kp.z) / mNew;
+                hp.z = mNew;
+                hv.z += kv.z;
+                hv.w = 1.0;   // flash
+                holes[2 * h + 1] = hv;
+                holes[2 * k] = vec4(1.0e6, 1.0e6, 0.0, 0.0);
+                holes[2 * k + 1] = vec4(0.0);
+                continue;
+            }
+            float inv = inversesqrt(r2 + uHoleSoft2);
+            a += d * (uG * kp.z * inv * inv * inv);
+        }
+        sHoleAcc[h] = a;
+        holes[2 * h] = hp;
+    }
+
+    for (int h = 0; h < uHoleCount; h++) {
+        vec4 hp = holes[2 * h];
+        if (hp.z <= 0.0) continue;
+        vec4 hv = holes[2 * h + 1];
+        hv.xy += sHoleAcc[h] * uDt;
+        hp.xy += hv.xy * uDt;
+        hp.w = max(uMinRadius, uRadiusPerMass * hp.z);
+        hv.w *= 0.97;
+        if (dot(hp.xy, hp.xy) > uBound * uBound) {
+            hp = vec4(1.0e6, 1.0e6, 0.0, 0.0);
+            hv = vec4(0.0);
+        }
+        holes[2 * h] = hp;
+        holes[2 * h + 1] = hv;
+    }
+}

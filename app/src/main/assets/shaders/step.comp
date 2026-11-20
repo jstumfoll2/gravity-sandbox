@@ -1,0 +1,133 @@
+#version 310 es
+// One simulation step for every particle.
+// Gravity is an exact all-pairs sum, tiled through shared memory (the classic
+// GPU Gems 3 ch.31 layout). Close neighbours (r < h) also get a soft pressure
+// push and viscosity, which is what lets dust settle into solid clumps
+// ("planets") instead of passing through itself.
+precision highp float;
+precision highp int;
+
+#define TILE 256
+#define MAX_HOLES 16
+#define MAX_TOUCH 10
+layout(local_size_x = TILE) in;
+
+struct Particle { vec4 pos; vec4 vel; };
+// pos = (x, y, mass, alive)   vel = (vx, vy, heat, density)
+layout(std430, binding = 0) readonly buffer Src { Particle src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { Particle dst[]; };
+// hole i: holes[2i] = (x, y, mass, radius), holes[2i+1] = (vx, vy, 0, 0)
+layout(std430, binding = 2) readonly buffer Holes { vec4 holes[]; };
+// per hole: swallowed mass, x momentum, y momentum (fixed point, integer atomics)
+layout(std430, binding = 3) buffer Absorb { int absorb[]; };
+
+uniform int uCount;        // multiple of TILE
+uniform int uHoleCount;
+uniform float uDt;
+uniform float uG;
+uniform float uSoft2;      // gravity softening squared
+uniform float uH;          // pressure / viscosity radius
+uniform float uK;          // pressure stiffness
+uniform float uVisc;       // viscosity
+uniform float uDrag;       // global velocity damping
+uniform float uHoleSoft2;
+uniform float uBound;      // particles beyond this radius are removed
+uniform float uHeatGain;
+uniform float uHeatDecay;
+uniform int uTouchCount;
+uniform vec4 uTouch[MAX_TOUCH];   // (x, y, strength, radius); strength > 0 pulls
+
+const float MASS_FP = 1.0e7;
+const float MOM_FP = 1.0e5;
+const vec4 DEAD_POS = vec4(1.0e6, 1.0e6, 0.0, 0.0);
+
+shared vec4 sPos[TILE];
+shared vec2 sVel[TILE];
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    Particle me = src[i];
+    vec2 p = me.pos.xy;
+    vec2 v = me.vel.xy;
+    float m = me.pos.z;
+    bool alive = me.pos.w > 0.5;
+
+    vec2 grav = vec2(0.0);
+    vec2 acc = vec2(0.0);
+    float dens = 0.0;
+    float heat = 0.0;
+    float h2 = uH * uH;
+    float invH = 1.0 / uH;
+
+    for (int tile = 0; tile < uCount; tile += TILE) {
+        Particle q = src[tile + int(lid)];
+        sPos[lid] = q.pos;
+        sVel[lid] = q.vel.xy;
+        barrier();
+        for (int j = 0; j < TILE; j++) {
+            vec4 qp = sPos[j];
+            vec2 d = qp.xy - p;
+            float r2 = dot(d, d);
+            float inv = inversesqrt(r2 + uSoft2);
+            grav += d * (qp.z * inv * inv * inv);
+            if (r2 < h2 && r2 > 1.0e-10) {
+                float r = sqrt(r2);
+                float w = 1.0 - r * invH;
+                vec2 dv = sVel[j] - v;
+                acc -= d * (uK * w / r);
+                acc += dv * (uVisc * w);
+                dens += w * w;
+                heat += w * dot(dv, dv);
+            }
+        }
+        barrier();
+    }
+
+    if (!alive) {
+        dst[i] = Particle(DEAD_POS, vec4(0.0));
+        return;
+    }
+
+    acc += grav * uG;
+
+    // black holes
+    int swallowedBy = -1;
+    for (int h = 0; h < uHoleCount; h++) {
+        vec4 hp = holes[2 * h];
+        if (hp.z <= 0.0) continue;
+        vec2 d = hp.xy - p;
+        float r2 = dot(d, d);
+        if (r2 < hp.w * hp.w) { swallowedBy = h; break; }
+        float inv = inversesqrt(r2 + uHoleSoft2);
+        acc += d * (uG * hp.z * inv * inv * inv);
+    }
+    if (swallowedBy >= 0) {
+        atomicAdd(absorb[3 * swallowedBy + 0], int(m * MASS_FP + 0.5));
+        atomicAdd(absorb[3 * swallowedBy + 1], int(round(m * v.x * MOM_FP)));
+        atomicAdd(absorb[3 * swallowedBy + 2], int(round(m * v.y * MOM_FP)));
+        dst[i] = Particle(DEAD_POS, vec4(0.0));
+        return;
+    }
+
+    // thumbs
+    for (int t = 0; t < uTouchCount; t++) {
+        vec4 tc = uTouch[t];
+        vec2 d = tc.xy - p;
+        float r = length(d) + 1.0e-3;
+        float f = tc.z * (1.0 - smoothstep(0.0, tc.w, r));
+        acc += d / r * f;
+    }
+
+    v += acc * uDt;
+    v *= max(0.0, 1.0 - uDrag * uDt);
+    p += v * uDt;
+
+    float temp = me.vel.z * max(0.0, 1.0 - uHeatDecay * uDt) + heat * uHeatGain * uDt;
+
+    if (dot(p, p) > uBound * uBound || any(isnan(p))) {
+        dst[i] = Particle(DEAD_POS, vec4(0.0));
+        return;
+    }
+    dst[i] = Particle(vec4(p, m, 1.0), vec4(v, min(temp, 1.0e4), dens));
+}
